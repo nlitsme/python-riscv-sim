@@ -19,10 +19,13 @@ import random
 #      - NF5 tests need S mode
 #      - Titan-M2 runs without S mode
 
-# TODO: support irq calls
+# TODO: support irq calls  -> note TODO in trap-handler.
 # TODO: extract code for devices from mem.store, mem.load
 # TODO: add fast (in-python) implementations for certains calls, like memset, memcpu, sha256, modexp
 # TODO: implement pmp memory protection
+# TODO: merge disassemble and simulate functions
+# todo: add special handlers for certain memory addresses
+# todo: add special handlers for certain subroutines.
 
 
 # register names:
@@ -177,7 +180,11 @@ def maskbits(n):
 
 
 def reorderbits(value, *bitspec):
-    """ bits specifies where a bit from that position should be copied to, in big-endian order """
+    """
+    bitspec specifies where a bit from that position should be copied to, in big-endian order
+
+    This function is used to decode values using the bit-order as specified in the riscv-spec.
+    """
     # in imm20 order:
     #    20 10-1 11 19-12 -> ofs bits
     #    19 18-9 8   7-0  -> imm20 bits
@@ -196,6 +203,7 @@ def reorderbits(value, *bitspec):
             bit = value&1
             value >>= 1
             result |= bit<<b
+
     return result
 
 
@@ -222,17 +230,23 @@ def unsigned(val, bits=32):
 
 class NamedBitFields:
     """
-    example spec:
-    mstatus = NamedBitFields(SPP=8, MPP=(12,11), FS=(14,13), XS=(16,15))
-    mstatus.MPP = 1
+    Create named bitfields.
+    The specification is passed using keyword arguments, where an integer
+    value indicates a single bit, and a tuple indicates an inclusive range of bits.
 
-    access all 32 bits using the `bits()` method.
+    example spec:
+        mstatus = NamedBitFields(SPP=8, MPP=(12,11), FS=(14,13), XS=(16,15))
+        mstatus.MPP = 1
+
+    access to all 32 bits using the `bits()` method.
     """
     def __init__(self, **spec):
         self._spec = spec
         self._value = 0
+
     def bits(self): return self._value
     def setbits(self, value): self._value = value
+
     def __getattr__(self, name):
         match bits := self._spec.get(name):
             case (hi, lo):
@@ -241,6 +255,7 @@ class NamedBitFields:
                 return self._value>>bit & 1
             case None:
                 raise AttributeError()
+
     def __setattr__(self, name, value):
         if name.startswith('_'):
             return super().__setattr__(name, value)
@@ -254,6 +269,7 @@ class NamedBitFields:
                 self._value |= (value&1)<<bit
             case None:
                 return super().__setattr__(name, value)
+
     def __repr__(self):
         txt = ""
         for k in self._spec.keys():
@@ -264,6 +280,7 @@ class NamedBitFields:
 class Instruction:
     """
     Represent a decoded instruction.
+    This is the object returned by InstructionPattern.decode()
     """
     def __init__(self, opc, mnemonic, args):
         self.opc = opc
@@ -281,7 +298,7 @@ class Instruction:
 
 class InstructionPattern:
     """
-    represents a instruction pattern from the riscv-opcodes repository
+    Represents a instruction pattern from the riscv-opcodes repository
     """
     def __init__(self, line, decoder):
         self.decoder = decoder
@@ -297,11 +314,6 @@ class InstructionPattern:
         self.parse(line)
 
     def parse(self, line):
-        """
-        note: currently one unhandled case:
-        riscv-crypto/tools/opcodes-crypto-scalar-rv64
-             aes64ks1i  rd rs1 rcon rcon:<=10 31..30=0 29..25=0b11000 24=1     14..12=0b001 6..0=0x13
-        """
         if m := re.match(r'''^(?:\$pseudo_op\s+\S+\s+)?(\S+)\s+(\S.*?\S)\s*(?:#\s*(.*))?$''', line):
             self.insnname = m.group(1)
             fieldspec = m.group(2)
@@ -335,7 +347,12 @@ class InstructionPattern:
                         print("WARN: bits already maked: %s" % spec)
                     self.namedmask |= newmask
                     # print("spec is named: %s(%d,%d) -> %x" % (spec, b1, b0, newmask))
-                else:
+                elif self.decoder.args.verbose:
+                    """
+                    note: currently one unhandled case:
+                    riscv-crypto/tools/opcodes-crypto-scalar-rv64
+                         aes64ks1i  rd rs1 rcon rcon:<=10 31..30=0 29..25=0b11000 24=1     14..12=0b001 6..0=0x13
+                    """
                     print("WARN: unknown spec: %s" % spec)
         else:
             print("WARN: unrecognised opcode line: %s" % line)
@@ -357,10 +374,12 @@ class InstructionPattern:
 
     def allmasks(self):
         return self.namedmask | self.valuemask | self.ignoremask
+
     def matches(self, opc):
         if opc & ~ self.allmasks():
             return False
         return (opc & self.valuemask) == self.value
+
     def decode(self, opc):
         info = []
         for f in self.named:
@@ -373,10 +392,11 @@ class InstructionPattern:
 
 class InstructionDecoder:
     """
-    reads instruction definitions from riscv-opcodes, and uses that information to decode
+    Reads instruction definitions from riscv-opcodes, and uses that information to decode
     opcodes.
     """
-    def __init__(self):
+    def __init__(self, args):
+        self.args = args
         self.instructions = []
         self.namedbitfields = dict()
         self.csr_regs = dict()
@@ -409,6 +429,7 @@ class InstructionDecoder:
         yield "illegal     15..0=0"
 
     def loadconstants(self, fn):
+        # loads constants used in the instruction definitions.
         for line in open(fn):
             if m := re.match(r"^\s*\(\s*(0x\w\w\w)\s*,\s*'(\S+)'\),", line):
                 regnum = int(m[1], 0)
@@ -418,7 +439,8 @@ class InstructionDecoder:
                     #  csr07b2: dscratch0 / dscratch
                     #  csr0f15: mconfigptr / mentropy
                     if self.csr_regs[regnum] != regname:
-                        print("WARNING: multiple names for csr%04x: %s / %s" % (regnum, self.csr_regs[regnum], regname))
+                        if self.args.verbose:
+                            print("WARNING: multiple names for csr%04x: %s / %s" % (regnum, self.csr_regs[regnum], regname))
                 else:
                     self.csr_regs[regnum] = regname
 
@@ -428,8 +450,9 @@ class InstructionDecoder:
                 lowbit = int(m[3])
                 if fieldname in self.namedbitfields:
                     if self.namedbitfields[fieldname] != (highbit, lowbit):
-                        # note: inconsistency in defs for main/cryptp: shamt -> main: (26, 20) / crypto: (25, 20)
-                        print("WARNING: incompatible field def: %s -> %s / %s" % (fieldname, self.namedbitfields[fieldname], (highbit, lowbit)))
+                        if self.args.verbose:
+                            # note: inconsistency in defs for main/cryptp: shamt -> main: (26, 20) / crypto: (25, 20)
+                            print("WARNING: incompatible field def: %s -> %s / %s" % (fieldname, self.namedbitfields[fieldname], (highbit, lowbit)))
                 else:
                     self.namedbitfields[fieldname] = (highbit, lowbit)
 
@@ -540,6 +563,9 @@ class InstructionDecoder:
 
 
 class PRIV:
+    """
+    Named constants for the privilege levels.
+    """
     USER   = 0
     SUPER  = 1
     MACHINE= 3
@@ -615,13 +641,16 @@ class CPU:
         self.mstatus.MIE = 0
         self.mstatus.MPRV = 0
         self.mcause = 0
+        self.mcycle = 0
         self.medeleg = 0   # initially 0, optionally support delegate to priv=super mode.
         self.mhartid = 0   # always 0, since we are emulating a single core cpu.
         self.csr7c4 = 0   # Titan-M2 specific
         self.pc = 0
 
     def __getattr__(self, name):
-        # convenience accessors
+        """
+        Convenience accessors, so I can access registers and CSRs by name.
+        """
         if name in self._csrnums:
             return self.getcsreg(self._csrnums[name])
         elif name in self._rnums:
@@ -629,6 +658,7 @@ class CPU:
         else:
             print("unknown attr: %s" % name)
             raise AttributeError()
+
     def __setattr__(self, name, value):
         # convenience setters
         if name in self._csrnums:
@@ -643,6 +673,7 @@ class CPU:
         if self._regs[num] is None:
             print("read from uninitialized reg %s" % self.regname(num))
         return self._regs[num] or 0
+
     def setreg(self, num, value):
         # set reg by number
         if num==0:
@@ -687,6 +718,7 @@ class CPU:
 
     def priv(self):
         return self._curpriv
+
     def setpriv(self, p):
         print("change priv from %s to %s" % (PRIV.name(self._curpriv), PRIV.name(p)))
         self._curpriv = p
@@ -761,6 +793,7 @@ class BreakException(Exception):
 
 class IllegalInstruction(Exception):
     pass
+
 
 # TODO
 # a device plugin has:
@@ -853,6 +886,9 @@ class Memory:
             o += len(opcbytes)
 
     def loadimage(self, addr, data):
+        """
+        loads a raw binary image.
+        """
         for i, b in enumerate(data):
             self.storevalue(addr+i, 8, b, True)
 
@@ -933,6 +969,10 @@ class NameResolver:
     def load(self, fn):
         """
         load names from the given file.
+        The file has a simple format, where
+        each line starts with a name and address.
+
+        I use the output of the ghidra 'ctrl-t' symbol table, and copy-paste that to a file.
         """
         x = dict()
         for line in open(fn, "r"):
@@ -991,6 +1031,12 @@ class NameResolver:
 
 
 def decodehex(fh):
+    """
+    Decode 'verilogtxt' files as supplied by `NF5`.
+    These files consist of lines with a single address, followed by lines with hex bytes.
+
+    This function yields tuples of (offset, data)
+    """
     ofs = None
     data = None
     for line in fh:
@@ -1029,6 +1075,9 @@ def decodecall(cpu, names, txt):
 
 
 def get_trap_vector(vector, cause):
+    """
+    return the trap address for the cause.
+    """
     def is_interrupt(c):
         # TODO
         return False
@@ -1041,6 +1090,9 @@ def get_trap_vector(vector, cause):
 
 
 def do_trap(cpu, cause):
+    """
+    Handle various kinds of traps.
+    """
     if cpu.medeleg & (1<<cause) and cpu.priv()!=PRIV.MACHINE:
         del_priv = PRIV.SUPER
     else:
@@ -1086,6 +1138,9 @@ def do_trap(cpu, cause):
 
 
 def do_xret(cpu, retname):
+    """
+    handle return-from-trap
+    """
     match retname:
         case 'mret':
             cpu.mstatus.MIE = cpu.mstatus.MPIE
@@ -1105,7 +1160,7 @@ def do_xret(cpu, retname):
             # TODO: in sail, in 'exception_handler', first curpriv is set to super or user, then tested, == machine ??
             #     cur_privilege   = if mstatus.SPP() == 0b1 then Supervisor else User;
             #     mstatus->SPP()  = 0b0;
-            #     if   cur_privilege != Machine
+            #     if   cur_privilege != Machine   << this would always be true, right??
             #     then mstatus->MPRV() = 0b0;
 
             if cpu.priv() != PRIV.MACHINE:
@@ -1122,14 +1177,16 @@ def do_xret(cpu, retname):
 
 
 def evaluate_instruction(args, cpu, mem, logger, insn):
-    #f args.trace:
-    #   cpu.dump()
+    """
+    Evaluate a single decoded instruction.
+    """
 
+    # source: riscv-spec.
     #   paragraph 18.8, pages 124 - 125  have the detailed summary of 16-bit instructions.
     #   chapter 27, pages 150 - 156 have the detailed summary of 32-bit instructions
 
-    # TODO: move common code, like branches to functions.
     # note: regnames inding in '_p'  are compressed regnums.
+    # compressed regnum to full regnum:  r = c_r + 8 
     newpc = None
     match insn.mnemonic:
         # moves
@@ -1484,8 +1541,9 @@ def evaluate_instruction(args, cpu, mem, logger, insn):
         case 'sfence.vma':
             pass
 
-        # custom insn
+        # custom Titan-M2 instructions.
         case 'grbitscan':
+            # count number of zeroes starting from bit 31
             x = cpu.reg(insn.rs1)
             i = 31
             while i>0:
@@ -1496,6 +1554,7 @@ def evaluate_instruction(args, cpu, mem, logger, insn):
             cpu.setreg(insn.rd, 32-i)
 
         case 'gbitscan':
+            # count number of zeroes starting from bit 0
             x = cpu.reg(insn.rs1)
             i = 0
             while i<32:
@@ -1506,22 +1565,27 @@ def evaluate_instruction(args, cpu, mem, logger, insn):
             cpu.setreg(insn.rd, i)
 
         case 'gbswap32':
+            # byte-order swap
             x = cpu.reg(insn.rs1)
             x = (x>>24) | ((x>>8)&0xff00) | ((x<<8)&0xff0000) | ((x&0xFF) <<24)
             cpu.setreg(insn.rd, x)
         case 'gclrbit':
+            # clear bit by bitnumber from register
             x = cpu.reg(insn.rs1)
             bit = cpu.reg(insn.rs2)
             cpu.setreg(insn.rd, x & ~(1<<bit))
         case 'gsetbit':
+            # set bit by bitnumber from register
             x = cpu.reg(insn.rs1)
             bit = cpu.reg(insn.rs2)
             cpu.setreg(insn.rd, x | (1<<bit))
         case 'gclrbiti':
+            # clear bit by bitnumber from immediate
             x = cpu.reg(insn.rs1)
             bit = insn.shamt
             cpu.setreg(insn.rd, x & ~(1<<bit))
         case 'gsetbiti':
+            # set bit by bitnumber from immediate
             x = cpu.reg(insn.rs1)
             bit = insn.shamt
             cpu.setreg(insn.rd, x | (1<<bit))
@@ -1535,6 +1599,12 @@ def evaluate_instruction(args, cpu, mem, logger, insn):
 
 
 def disassemble_instruction(cpu, insn):
+    """
+    disassemble a single decoded instruction.
+
+    Note that I don't follow the standard way of disassembling Risc-V instructions.
+    For loads and stores, I add [] around the registers specifying the offset.
+    """
     operands = None
     mnemonic = insn.mnemonic
     match mnemonic:
@@ -1833,10 +1903,9 @@ def disassemble_instruction(cpu, insn):
 
 
 def simulate(decoder, names, args):
-    # todo: add special handlers for certain memory addresses
-    # todo: add special handlers for certain subroutines.
-
-    # compressed regnum to full regnum:  r = c_r + 8 
+    """
+    Load state, then simulate the specified calls.
+    """
 
     cpu = CPU(args)
     mem = Memory(args)
@@ -1970,6 +2039,9 @@ def simulate(decoder, names, args):
                 cpu.setreg(reg, value)
 
             while cpu.pc in mem.memory and not ctrlc_pressed:
+
+                cpu.mcycle += 1
+
                 for bc in args.breakcodes:
                     if recentcode[-len(bc):] == bc:
                         print("break on recentcode: %s" % bc.hex())
@@ -1996,6 +2068,7 @@ def simulate(decoder, names, args):
                     print("%s%08x: %s: **unimplemented**" % ("  "*logger.indent, cpu.pc, "%08x" % opc if opc&3 == 3 else "    %04x" % opc))
                     cpu.pc = cpu.nextpc
                     continue
+
                 mnemonic, operands = disassemble_instruction(cpu, insn)
                 print("%s%08x: %s: %-10s %s" % ("  "*logger.indent, cpu.pc, "%08x" % opc if opc&3 == 3 else "    %04x" % opc, mnemonic, operands))
 
@@ -2028,7 +2101,10 @@ def simulate(decoder, names, args):
 
 
 def disassemble(decoder, names, args):
-    # TODO: merge disassemble and simulate functions
+    """
+    Load memory and images, then disassemble the code range specified
+    using --startaddr and --endaddr.
+    """
     cpu = CPU(args)
     mem = Memory(args)
     if args.insn:
@@ -2111,6 +2187,7 @@ def main():
  
     parser = argparse.ArgumentParser(description='Riscv instruction decoder')
     parser.add_argument('--trace', action='store_true', help='trace simulation execution')
+    parser.add_argument('--verbose', action='store_true')
     parser.add_argument('--debugdecoder', action='store_true', help='output details of insn decoding')
     parser.add_argument('--hex', '-x', action='store_true', help='args are hex numbers')
     parser.add_argument('--bytes', '-b', action='store_true', help='args are byte lists, implies hex')
@@ -2133,7 +2210,7 @@ def main():
 
     # image load
     parser.add_argument('--loadimage', '-l', dest='images', action=ArrayArg, type=str, help='loadimage at offset.', metavar='filename@OFS', default=[])
-    parser.add_argument('--heximage', dest='heximages', action=ArrayArg, type=str, help='load hex image.', metavar='filename', default=[])
+    parser.add_argument('--heximage', dest='heximages', action=ArrayArg, type=str, help='load hex(verilogtxt) image.', metavar='filename', default=[])
 
     # custom reg/mem edits
     parser.add_argument('--setreg', '-r', dest='registers', action=ArrayArg, type=str, help='set register values', metavar='regname=value', default=[])
@@ -2167,7 +2244,7 @@ def main():
 
     args.insn = [convertarg(a) for a in args.insn]
 
-    decoder = InstructionDecoder()
+    decoder = InstructionDecoder(args)
     CPU._csrnames = decoder.csr_regs
 
     names = NameResolver()
